@@ -1463,6 +1463,8 @@
 
         // State Variables
         let products = [...DEFAULT_PRODUCTS];
+        let deletedProductIds = [];
+        let latestCloudProducts = [];
         let cart = {}; // { productId: { product, quantity } }
         let currentCategory = "all";
         let searchQuery = "";
@@ -1492,6 +1494,7 @@
 
         // Initialize App
         window.addEventListener('DOMContentLoaded', () => {
+            loadDeletedProductIds();
             loadProductsFromStorage();
             loadCartFromStorage();
             renderCategories();
@@ -1503,38 +1506,55 @@
             listenToLiveOrders();
         });
 
-        // Realtime Products Sync from Firestore
+        // Realtime Products Sync from Firestore (always merged with DEFAULT_PRODUCTS)
         function listenToProducts() {
             if (!firestoreDb) return;
-            firestoreDb.collection("products").onSnapshot(snapshot => {
-                if (!snapshot.empty) {
-                    const cloudProducts = [];
-                    snapshot.forEach(doc => {
-                        const data = doc.data() || {};
-                        const def = DEFAULT_PRODUCTS.find(d => d.id === doc.id);
-                        const existingLocal = products.find(lp => lp.id === doc.id);
-                        const fallbackStock = existingLocal && typeof existingLocal.stock === 'number' ? existingLocal.stock : (def ? def.stock : 25);
-                        cloudProducts.push({
-                            id: doc.id,
-                            name: data.name || (def ? def.name : ''),
-                            category: data.category || (def ? def.category : 'grocery'),
-                            price: typeof data.price === 'number' ? data.price : (def ? def.price : 0),
-                            originalPrice: typeof data.originalPrice === 'number' ? data.originalPrice : (def ? def.originalPrice : 0),
-                            isFlashDeal: typeof data.isFlashDeal === 'boolean' ? data.isFlashDeal : (def ? def.isFlashDeal : false),
-                            dealBadge: data.dealBadge !== undefined ? data.dealBadge : (def ? def.dealBadge : ''),
-                            weight: data.weight || (def ? def.weight : ''),
-                            stock: typeof data.stock === 'number' ? Math.max(0, Math.floor(data.stock)) : fallbackStock,
-                            imageUrl: data.imageUrl || (def ? def.imageUrl : 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=500')
-                        });
-                    });
-                    if (cloudProducts.length > 0) {
-                        products = cloudProducts;
+
+            firestoreDb.collection("store_settings").doc("deleted_products").onSnapshot(doc => {
+                if (doc.exists) {
+                    const data = doc.data() || {};
+                    if (Array.isArray(data.ids)) {
+                        deletedProductIds = Array.from(new Set(data.ids));
+                        saveDeletedProductIds();
+                        products = mergeProductsList(latestCloudProducts.length > 0 ? latestCloudProducts : products);
                         saveProductsToStorage();
                         renderProducts();
                         renderHeroDealsCarousel();
-                        renderAdminProductsList();
+                        filterAdminProductsList();
                     }
                 }
+            }, err => console.log("Deleted products sync skipped:", err));
+
+            firestoreDb.collection("products").onSnapshot(snapshot => {
+                if (snapshot.empty && snapshot.metadata && snapshot.metadata.fromCache) {
+                    return;
+                }
+                const cloudProducts = [];
+                snapshot.forEach(doc => {
+                    const data = doc.data() || {};
+                    const def = DEFAULT_PRODUCTS.find(d => d.id === doc.id);
+                    const existingLocal = products.find(lp => lp.id === doc.id);
+                    const fallbackStock = existingLocal && typeof existingLocal.stock === 'number' ? existingLocal.stock : (def ? def.stock : 25);
+                    cloudProducts.push({
+                        id: doc.id,
+                        name: data.name || (def ? def.name : ''),
+                        category: data.category || (def ? def.category : 'grocery'),
+                        price: typeof data.price === 'number' ? data.price : (def ? def.price : 0),
+                        originalPrice: typeof data.originalPrice === 'number' ? data.originalPrice : (def ? def.originalPrice : 0),
+                        isFlashDeal: typeof data.isFlashDeal === 'boolean' ? data.isFlashDeal : (def ? def.isFlashDeal : false),
+                        dealBadge: data.dealBadge !== undefined ? data.dealBadge : (def ? def.dealBadge : ''),
+                        weight: data.weight || (def ? def.weight : ''),
+                        stock: typeof data.stock === 'number' ? Math.max(0, Math.floor(data.stock)) : fallbackStock,
+                        imageUrl: data.imageUrl || (def ? def.imageUrl : 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=500'),
+                        createdAt: typeof data.createdAt === 'number' ? data.createdAt : 0
+                    });
+                });
+                latestCloudProducts = cloudProducts;
+                products = mergeProductsList(cloudProducts);
+                saveProductsToStorage();
+                renderProducts();
+                renderHeroDealsCarousel();
+                filterAdminProductsList();
             }, err => console.log("Products sync skipped:", err));
         }
 
@@ -2034,7 +2054,18 @@
                     prod.stock = newStock;
                     anyChanged = true;
                     if (firestoreDb) {
-                        firestoreDb.collection("products").doc(prod.id).update({ stock: newStock }).catch(e => console.warn(e));
+                        firestoreDb.collection("products").doc(prod.id).set({
+                            id: prod.id,
+                            name: prod.name,
+                            category: prod.category,
+                            price: prod.price,
+                            originalPrice: prod.originalPrice || 0,
+                            isFlashDeal: !!prod.isFlashDeal,
+                            dealBadge: prod.dealBadge || '',
+                            weight: prod.weight || '',
+                            stock: newStock,
+                            imageUrl: prod.imageUrl || ''
+                        }, { merge: true }).catch(e => console.warn(e));
                     }
                 }
             });
@@ -2042,7 +2073,7 @@
                 saveProductsToStorage();
                 renderProducts();
                 renderHeroDealsCarousel();
-                renderAdminProductsList();
+                filterAdminProductsList();
             }
         }
 
@@ -2559,24 +2590,86 @@
             renderAdminOrdersList();
         }
 
-        // Storage Helpers for Custom Products
+        // Storage Helpers for Custom & Merged Products
+        function loadDeletedProductIds() {
+            try {
+                const raw = localStorage.getItem('hyper_deleted_product_ids');
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (Array.isArray(parsed)) {
+                        deletedProductIds = Array.from(new Set(parsed.map(String)));
+                        return;
+                    }
+                }
+            } catch (e) {
+                console.warn("Could not load deleted product IDs:", e);
+            }
+            deletedProductIds = [];
+        }
+
+        function saveDeletedProductIds() {
+            try {
+                localStorage.setItem('hyper_deleted_product_ids', JSON.stringify(deletedProductIds));
+            } catch (e) {
+                console.warn("Could not save deleted product IDs:", e);
+            }
+        }
+
+        function mergeProductsList(sourceList) {
+            const deletedSet = new Set(deletedProductIds);
+            const defaultIds = new Set(DEFAULT_PRODUCTS.map(d => d.id));
+            const byId = new Map();
+
+            (Array.isArray(sourceList) ? sourceList : []).forEach(item => {
+                if (item && item.id && !deletedSet.has(item.id)) {
+                    byId.set(item.id, {
+                        ...item,
+                        stock: typeof item.stock === 'number' ? Math.max(0, Math.floor(item.stock)) : 25
+                    });
+                }
+            });
+
+            const customProducts = [];
+            byId.forEach((item, id) => {
+                if (!defaultIds.has(id)) {
+                    customProducts.push(item);
+                }
+            });
+
+            customProducts.sort((a, b) => {
+                const getTs = (p) => {
+                    if (typeof p.createdAt === 'number' && p.createdAt > 0) return p.createdAt;
+                    const m = String(p.id).match(/^prod_(\d+)/);
+                    return m ? parseInt(m[1], 10) : 0;
+                };
+                return getTs(b) - getTs(a);
+            });
+
+            const mergedDefaults = DEFAULT_PRODUCTS
+                .filter(def => !deletedSet.has(def.id))
+                .map(def => {
+                    const override = byId.get(def.id);
+                    return override ? { ...def, ...override } : { ...def };
+                });
+
+            return [...customProducts, ...mergedDefaults];
+        }
+
         function loadProductsFromStorage() {
             try {
                 const saved = localStorage.getItem('hyper_products_custom');
                 if (saved) {
                     const parsed = JSON.parse(saved);
                     if (Array.isArray(parsed) && parsed.length > 0) {
-                        products = parsed.map(p => ({
-                            ...p,
-                            stock: typeof p.stock === 'number' ? Math.max(0, Math.floor(p.stock)) : 25
-                        }));
+                        products = mergeProductsList(parsed);
+                        saveProductsToStorage();
                         return;
                     }
                 }
             } catch (e) {
                 console.warn("Could not load stored products:", e);
             }
-            products = DEFAULT_PRODUCTS.map(p => ({ ...p }));
+            products = mergeProductsList([]);
         }
 
         function saveProductsToStorage() {
@@ -2667,7 +2760,8 @@
                 dealBadge: dealBadge,
                 weight: weight,
                 stock: stock,
-                imageUrl: imageUrl
+                imageUrl: imageUrl,
+                createdAt: Date.now()
             };
 
             // Add new product at top of array
@@ -2693,7 +2787,7 @@
             closeAddProductModal();
             renderProducts();
             renderHeroDealsCarousel();
-            renderAdminProductsList();
+            filterAdminProductsList();
 
             alert(`تمت إضافة الصنف "${name}" (المخزون: ${stock}) بنجاح إلى المتجر! 📦✨`);
         }
@@ -2703,16 +2797,22 @@
             if (!p) return;
 
             if (confirm(`هل أنت متأكد من حذف الصنف "${p.name}" نهائياً من المتجر؟`)) {
+                if (!deletedProductIds.includes(productId)) {
+                    deletedProductIds.push(productId);
+                    saveDeletedProductIds();
+                }
+                latestCloudProducts = latestCloudProducts.filter(x => x.id !== productId);
                 products = products.filter(x => x.id !== productId);
                 saveProductsToStorage();
 
                 if (firestoreDb) {
                     firestoreDb.collection("products").doc(productId).delete().catch(e => console.warn(e));
+                    firestoreDb.collection("store_settings").doc("deleted_products").set({ ids: deletedProductIds }, { merge: true }).catch(e => console.warn(e));
                 }
 
                 renderProducts();
                 renderHeroDealsCarousel();
-                renderAdminProductsList();
+                filterAdminProductsList();
                 alert(`تم حذف "${p.name}" من المتجر بنجاح.`);
             }
         }
@@ -2863,13 +2963,18 @@
                 }
                 saveProductsToStorage();
                 if (firestoreDb) {
-                    firestoreDb.collection("products").doc(productId).update({
+                    firestoreDb.collection("products").doc(productId).set({
+                        id: p.id,
+                        name: p.name,
+                        category: p.category,
                         price: p.price,
                         stock: p.stock,
                         originalPrice: p.originalPrice,
                         isFlashDeal: p.isFlashDeal,
-                        dealBadge: p.dealBadge
-                    }).catch(e => console.warn(e));
+                        dealBadge: p.dealBadge,
+                        weight: p.weight || '',
+                        imageUrl: p.imageUrl || ''
+                    }, { merge: true }).catch(e => console.warn(e));
                 }
                 renderProducts();
                 renderHeroDealsCarousel();
