@@ -9,9 +9,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
-    <!-- Firebase SDKs -->
-    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
+    <!-- Firebase SDKs v10 (Supports Named Firestore Database) -->
 
     <style>
         :root {
@@ -1265,7 +1263,10 @@
         <div class="modal-box wide">
             <div class="modal-header">
                 <div>
-                    <h3 style="color: var(--brand-red);">لوحة تحكم وإدارة هايبر الحياة ⚡</h3>
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                        <h3 style="color: var(--brand-red);">لوحة تحكم وإدارة هايبر الحياة ⚡</h3>
+                        <span id="admin-cloud-sync-badge" style="font-size: 11px; background: #fef9c3; color: #854d0e; border: 1px solid #fde047; padding: 2px 8px; border-radius: 999px; font-weight: bold;">جارٍ الاتصال بالسحابة... ⏳</span>
+                    </div>
                     <small style="color: var(--text-secondary);">استقبال الطلبات، الأسعار، الفواتير، وتقارير المبيعات</small>
                 </div>
                 <button class="btn-close" onclick="closeAdminPanelModal()">&times;</button>
@@ -1428,6 +1429,86 @@
     <!-- Hidden element for thermal receipt printing -->
     <div id="printable-receipt" style="display: none;"></div>
 
+    <!-- Firebase Named Database Module Bridge -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+        import {
+            getFirestore,
+            collection,
+            doc,
+            setDoc,
+            updateDoc,
+            deleteDoc,
+            onSnapshot,
+            query,
+            orderBy
+        } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+
+        const FIRESTORE_DATABASE_ID = "ai-studio-android-codetoap-5fbcd225-09a3-491a-802d-6064f098f7c0";
+
+        try {
+            const firebaseConfig = {
+                apiKey: "AIzaSyDts8ayXJkf1hL4-Q43iuBj639y4f972-w",
+                projectId: "gen-lang-client-0361537594"
+            };
+            const app = initializeApp(firebaseConfig);
+            const rawDb = getFirestore(app, FIRESTORE_DATABASE_ID);
+
+            const makeDocRef = (colName, docId) => {
+                const ref = doc(rawDb, colName, String(docId));
+                return {
+                    set: (data, opts) => opts ? setDoc(ref, data, opts) : setDoc(ref, data),
+                    update: (data) => updateDoc(ref, data),
+                    delete: () => deleteDoc(ref),
+                    onSnapshot: (onNext, onError) => onSnapshot(ref, (snap) => {
+                        onNext({
+                            exists: snap.exists(),
+                            id: snap.id,
+                            data: () => snap.data(),
+                            metadata: snap.metadata
+                        });
+                    }, onError)
+                };
+            };
+
+            const makeQueryWrapper = (qRef) => ({
+                onSnapshot: (onNext, onError) => onSnapshot(qRef, (snap) => {
+                    const mappedDocs = snap.docs.map(d => ({
+                        id: d.id,
+                        data: () => d.data()
+                    }));
+                    onNext({
+                        empty: snap.empty,
+                        size: snap.size,
+                        metadata: snap.metadata,
+                        docs: mappedDocs,
+                        forEach: (cb) => mappedDocs.forEach(cb)
+                    });
+                }, onError)
+            });
+
+            window.firestoreDb = {
+                collection: (colName) => {
+                    const colRef = collection(rawDb, colName);
+                    return {
+                        doc: (docId) => makeDocRef(colName, docId),
+                        orderBy: (field, dir = 'asc') => makeQueryWrapper(query(colRef, orderBy(field, dir))),
+                        onSnapshot: (onNext, onError) => makeQueryWrapper(colRef).onSnapshot(onNext, onError)
+                    };
+                }
+            };
+            console.log("Firebase named database initialized:", FIRESTORE_DATABASE_ID);
+            if (typeof window.onFirebaseReady === 'function') {
+                window.onFirebaseReady(window.firestoreDb);
+            }
+        } catch (e) {
+            console.error("Firebase initialization failed:", e);
+            if (typeof window.onFirebaseError === 'function') {
+                window.onFirebaseError(e);
+            }
+        }
+    </script>
+
     <!-- Web Application Logic -->
     <script>
         // Default Catalog Data
@@ -1473,24 +1554,83 @@
         let currentAdminFilter = "all";
         let currentAdminStockFilter = "all";
         let activeInvoice = null;
+        let firestoreDb = window.firestoreDb || null;
+        let firebaseListenersStarted = false;
 
         function getProductStock(p) {
             return (p && typeof p.stock === 'number' && !isNaN(p.stock)) ? Math.max(0, Math.floor(p.stock)) : 25;
         }
 
-        // Firebase Initialization
-        let firestoreDb = null;
-        try {
-            const firebaseConfig = {
-                apiKey: "AIzaSyDts8ayXJkf1hL4-Q43iuBj639y4f972-w",
-                projectId: "gen-lang-client-0361537594"
-            };
-            firebase.initializeApp(firebaseConfig);
-            firestoreDb = firebase.firestore();
-            console.log("Firebase initialized successfully");
-        } catch (e) {
-            console.warn("Firebase local initialization fallback:", e);
+        function updateCloudSyncBadge(state, text) {
+            const badge = document.getElementById('admin-cloud-sync-badge');
+            if (!badge) return;
+            badge.textContent = text;
+            if (state === 'connected') {
+                badge.style.background = '#dcfce7';
+                badge.style.color = '#166534';
+                badge.style.borderColor = '#86efac';
+            } else if (state === 'error') {
+                badge.style.background = '#fee2e2';
+                badge.style.color = '#991b1b';
+                badge.style.borderColor = '#fca5a5';
+            } else {
+                badge.style.background = '#fef9c3';
+                badge.style.color = '#854d0e';
+                badge.style.borderColor = '#fde047';
+            }
         }
+
+        function parseOrderItems(order) {
+            if (!order) return [];
+            if (Array.isArray(order.items) && order.items.length > 0) {
+                return order.items.map(i => ({
+                    productId: i.productId || '',
+                    name: i.name || 'صنف',
+                    price: Number(i.price) || 0,
+                    quantity: parseInt(i.quantity, 10) || 1,
+                    weight: i.weight || ''
+                }));
+            }
+            const raw = order.itemsJson;
+            if (!raw || typeof raw !== 'string') return [];
+            const trimmed = raw.trim();
+            if (trimmed.startsWith('[')) {
+                try {
+                    const parsed = JSON.parse(trimmed);
+                    if (Array.isArray(parsed)) return parsed;
+                } catch (e) {}
+            }
+            // Support Android tilde-delimited itemsJson format: id~name~price~qty~weight
+            return trimmed.split(/\r?\n|;/).filter(Boolean).map(line => {
+                const parts = line.split('~');
+                return {
+                    productId: parts[0] || '',
+                    name: parts[1] || line,
+                    price: parseFloat(parts[2]) || 0,
+                    quantity: parseInt(parts[3], 10) || 1,
+                    weight: parts[4] || ''
+                };
+            });
+        }
+
+        function startFirebaseSync() {
+            if (!firestoreDb || firebaseListenersStarted) return;
+            firebaseListenersStarted = true;
+            listenToProducts();
+            listenToStoreStatus();
+            listenToLiveOrders();
+        }
+
+        window.onFirebaseReady = function(db) {
+            firestoreDb = db;
+            updateCloudSyncBadge('connected', 'متصل بالسحابة ومتزامن 🟢');
+            startFirebaseSync();
+        };
+
+        window.onFirebaseError = function(err) {
+            updateCloudSyncBadge('error', 'تعذر الاتصال بالسحابة 🔴');
+            console.warn("Firebase error callback:", err);
+        };
 
         // Initialize App
         window.addEventListener('DOMContentLoaded', () => {
@@ -1501,9 +1641,13 @@
             renderProducts();
             renderHeroDealsCarousel();
             startHeroDealsTimer();
-            listenToProducts();
-            listenToStoreStatus();
-            listenToLiveOrders();
+            if (window.firestoreDb) {
+                firestoreDb = window.firestoreDb;
+                updateCloudSyncBadge('connected', 'متصل بالسحابة ومتزامن 🟢');
+                startFirebaseSync();
+            } else {
+                listenToStoreStatus();
+            }
         });
 
         // Realtime Products Sync from Firestore (always merged with DEFAULT_PRODUCTS)
@@ -1523,7 +1667,7 @@
                         filterAdminProductsList();
                     }
                 }
-            }, err => console.log("Deleted products sync skipped:", err));
+            }, err => console.warn("Deleted products sync error:", err));
 
             firestoreDb.collection("products").onSnapshot(snapshot => {
                 if (snapshot.empty && snapshot.metadata && snapshot.metadata.fromCache) {
@@ -1535,13 +1679,16 @@
                     const def = DEFAULT_PRODUCTS.find(d => d.id === doc.id);
                     const existingLocal = products.find(lp => lp.id === doc.id);
                     const fallbackStock = existingLocal && typeof existingLocal.stock === 'number' ? existingLocal.stock : (def ? def.stock : 25);
+                    const resolvedFlashDeal = typeof data.isFlashDeal === 'boolean'
+                        ? data.isFlashDeal
+                        : (typeof data.flashDeal === 'boolean' ? data.flashDeal : (def ? def.isFlashDeal : false));
                     cloudProducts.push({
                         id: doc.id,
                         name: data.name || (def ? def.name : ''),
                         category: data.category || (def ? def.category : 'grocery'),
                         price: typeof data.price === 'number' ? data.price : (def ? def.price : 0),
                         originalPrice: typeof data.originalPrice === 'number' ? data.originalPrice : (def ? def.originalPrice : 0),
-                        isFlashDeal: typeof data.isFlashDeal === 'boolean' ? data.isFlashDeal : (def ? def.isFlashDeal : false),
+                        isFlashDeal: resolvedFlashDeal,
                         dealBadge: data.dealBadge !== undefined ? data.dealBadge : (def ? def.dealBadge : ''),
                         weight: data.weight || (def ? def.weight : ''),
                         stock: typeof data.stock === 'number' ? Math.max(0, Math.floor(data.stock)) : fallbackStock,
@@ -1555,7 +1702,11 @@
                 renderProducts();
                 renderHeroDealsCarousel();
                 filterAdminProductsList();
-            }, err => console.log("Products sync skipped:", err));
+                updateCloudSyncBadge('connected', `متصل بالسحابة (${cloudProducts.length} صنف سحابي) 🟢`);
+            }, err => {
+                console.warn("Products sync error:", err);
+                updateCloudSyncBadge('error', 'خطأ في مزامنة السحابة 🔴');
+            });
         }
 
         // Store Open/Closed Realtime Listener
@@ -1575,7 +1726,7 @@
                             updateStoreStatusUI();
                         }
                     }
-                }, err => console.log(err));
+                }, err => console.warn(err));
             }
         }
 
@@ -2061,6 +2212,8 @@
                             price: prod.price,
                             originalPrice: prod.originalPrice || 0,
                             isFlashDeal: !!prod.isFlashDeal,
+                            flashDeal: !!prod.isFlashDeal,
+                            available: newStock > 0,
                             dealBadge: prod.dealBadge || '',
                             weight: prod.weight || '',
                             stock: newStock,
@@ -2167,7 +2320,7 @@
         }
 
         function formatWhatsAppOrderMessage(order) {
-            const items = JSON.parse(order.itemsJson);
+            const items = parseOrderItems(order);
             const itemsStr = items.map(i => `• ${i.name} (${i.weight}) × ${i.quantity} = ${(i.price * i.quantity).toFixed(2)} ج.م`).join('\n');
             const payStr = order.paymentMethod === 'card' ? 'بطاقة بنكية / فيزا 💳' : 'كاش عند الاستلام 💵';
             
@@ -2203,7 +2356,7 @@
         function openInvoiceModal(order) {
             activeInvoice = order;
             const body = document.getElementById('invoice-modal-body');
-            const items = JSON.parse(order.itemsJson);
+            const items = parseOrderItems(order);
             const dateStr = new Date(order.createdAtTimestamp).toLocaleString('ar-EG');
 
             body.innerHTML = `
@@ -2282,7 +2435,7 @@
 
         // Print POS Thermal Receipt
         function printThermalReceipt(order) {
-            const items = JSON.parse(order.itemsJson);
+            const items = parseOrderItems(order);
             const dateStr = new Date(order.createdAtTimestamp).toLocaleString('ar-EG');
             const receiptDiv = document.getElementById('printable-receipt');
 
@@ -2354,7 +2507,7 @@
                 `;
             } else {
                 body.innerHTML = history.map(order => {
-                    const items = JSON.parse(order.itemsJson);
+                    const items = parseOrderItems(order);
                     const dateStr = new Date(order.createdAtTimestamp).toLocaleString('ar-EG');
                     return `
                         <div style="border: 1px solid var(--card-border); border-radius: 14px; padding: 12px; margin-bottom: 12px; background: white;">
@@ -2401,7 +2554,7 @@
             const order = history.find(o => o.id === orderId);
             if (!order) return;
 
-            const items = JSON.parse(order.itemsJson);
+            const items = parseOrderItems(order);
             const skippedOut = [];
             items.forEach(item => {
                 const prod = products.find(p => p.id === item.productId) || {
@@ -2515,7 +2668,7 @@
             }
 
             listDiv.innerHTML = filtered.map(order => {
-                const items = JSON.parse(order.itemsJson || '[]');
+                const items = parseOrderItems(order);
                 const dateStr = new Date(order.createdAtTimestamp).toLocaleString('ar-EG');
                 const isNew = order.status === 'new';
 
@@ -2570,7 +2723,7 @@
             // If marking completed and stock hasn't been deducted yet (e.g. order came from mobile app), deduct stock now
             if (newStatus === 'completed' && o && !o.stockDeducted) {
                 try {
-                    const items = JSON.parse(o.itemsJson || '[]');
+                    const items = parseOrderItems(o);
                     if (items.length > 0) {
                         deductStockForItems(items);
                         o.stockDeducted = true;
@@ -2757,6 +2910,8 @@
                 price: price,
                 originalPrice: origPrice,
                 isFlashDeal: isFlashDeal,
+                flashDeal: isFlashDeal,
+                available: stock > 0,
                 dealBadge: dealBadge,
                 weight: weight,
                 stock: stock,
@@ -2770,7 +2925,15 @@
 
             // Sync to Firestore if available
             if (firestoreDb) {
-                firestoreDb.collection("products").doc(newProd.id).set(newProd).catch(e => console.warn(e));
+                firestoreDb.collection("products").doc(newProd.id).set(newProd)
+                    .then(() => updateCloudSyncBadge('connected', 'متصل بالسحابة وتمت المزامنة 🟢'))
+                    .catch(e => {
+                        console.error("Failed to save product to cloud:", e);
+                        updateCloudSyncBadge('error', 'فشل حفظ المنتج في السحابة 🔴');
+                        alert('⚠️ تم حفظ الصنف محلياً لكن تعذر رفعه للسحابة: ' + (e.message || e));
+                    });
+            } else {
+                alert('⚠️ تحذير: السحابة غير متصلة الآن، تم الحفظ محلياً فقط.');
             }
 
             // Reset form fields
@@ -2971,10 +3134,17 @@
                         stock: p.stock,
                         originalPrice: p.originalPrice,
                         isFlashDeal: p.isFlashDeal,
+                        flashDeal: p.isFlashDeal,
+                        available: p.stock > 0,
                         dealBadge: p.dealBadge,
                         weight: p.weight || '',
                         imageUrl: p.imageUrl || ''
-                    }, { merge: true }).catch(e => console.warn(e));
+                    }, { merge: true }).then(() => {
+                        updateCloudSyncBadge('connected', 'متصل بالسحابة وتمت المزامنة 🟢');
+                    }).catch(e => {
+                        console.error("Failed to update product in cloud:", e);
+                        updateCloudSyncBadge('error', 'فشل تحديث السحابة 🔴');
+                    });
                 }
                 renderProducts();
                 renderHeroDealsCarousel();
